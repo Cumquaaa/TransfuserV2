@@ -112,10 +112,10 @@ def _prepare_4d_causal_attention_mask_with_cache_position(
     return causal_mask
 
 class TransfusionConfig(LlamaConfig):
-    def __init__(self, num_diffusion_layers=1, **kwargs):
+    def __init__(self, num_diffusion_layers=1, num_patches=2, **kwargs):
         super().__init__(**kwargs)
         self.num_diffusion_layers = num_diffusion_layers
-        
+        self.num_patches = num_patches
 
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -374,19 +374,6 @@ class TransfusionAttention(nn.Module):
         # TODO (joao): remove in v4.45 (RoPE is computed in the model, not in the decoder layers)
         self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
 
-    def transfuser_mask(self, b, h, q_idx, kv_idx):
-        # Causal mask for the normal layers
-        if self.layer_idx
-        
-        
-        # Causal mask for text tokens
-
-        # Image tokens between <BOI> and <EOI>
-
-        # <EOI> token (optional: depends on if it should attend to image tokens or not)
-
-        return False  # Default case (not strictly necessary, but for clarity)
-    
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -397,6 +384,7 @@ class TransfusionAttention(nn.Module):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.45
+        type_tensor: Optional[torch.uint8] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
@@ -446,17 +434,40 @@ class TransfusionAttention(nn.Module):
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
+        
+        #==================== Original Attention Computation ===========================
+        # attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # if attention_mask is not None:  # no matter the length, we just slice it
+        #     causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        #     attn_weights = attn_weights + causal_mask
 
-        if attention_mask is not None:  # no matter the length, we just slice it
-            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-            attn_weights = attn_weights + causal_mask
+        # # upcast attention to fp32
+        # attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        # attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        # attn_output = torch.matmul(attn_weights, value_states)
+        
+        #======================== Flex Attention Computation ===========================
+        def transfuser_mask(self, b, h, q_idx, kv_idx):
+            # Causal mask for the normal layers
+            if self.layer_idx <= self.config.num_hidden_layers - self.config.num_diffusion_layers:
+                return q_idx >= kv_idx
+            # Bidirectional mask for the diffusion layers
+            else:
+                q_type = type_tensor[b, q_idx]
+                first_image_index = (type_tensor[b] != 0).nonzero(as_tuple=True)[0][0].item() if (type_tensor[b] != 0).any() else None
+                if q_type != 0:
+                    return q_idx >= first_image_index + ((kv_idx - first_image_index) // self.config.num_patches) * self.config.num_patches
+                else:
+                    return q_idx >= kv_idx
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
+        # Create the block mask using the custom `transfuser_mask` function
+        bsz, q_len, _ = hidden_states.size()  # batch_size = bsz, seq_length = q_len
+        block_mask = create_block_mask(transfuser_mask, B=bsz, H=self.num_heads, Q_LEN=q_len, KV_LEN=q_len)
+
+        # Apply the flex_attention function
+        attn_output = flex_attention(query_states, key_states, value_states, block_mask=block_mask)
+        #===============================================================================
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -486,7 +497,7 @@ TRANSFUSION_ATTENTION_CLASSES = {
 }
 
 
-class LlamaDecoderLayer(nn.Module):
+class TransfuserDecoderLayer(nn.Module):
     def __init__(self, config: TransfusionConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -507,6 +518,7 @@ class LlamaDecoderLayer(nn.Module):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.45
+        type_tensor: Optional[torch.uint8] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -545,6 +557,7 @@ class LlamaDecoderLayer(nn.Module):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
+            type_tensor=type_tensor,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -587,11 +600,12 @@ LLAMA_START_DOCSTRING = r"""
     "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
     LLAMA_START_DOCSTRING,
 )
-class LlamaPreTrainedModel(PreTrainedModel):
+class TransfuserPreTrainedModel(PreTrainedModel):
     config_class = TransfusionConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["LlamaDecoderLayer"]
+    # Change here?
+    _no_split_modules = ["TransfuserDecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
     _supports_flash_attn_2 = True
     _supports_sdpa = True
@@ -689,7 +703,7 @@ LLAMA_INPUTS_DOCSTRING = r"""
     "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
     LLAMA_START_DOCSTRING,
 )
-class LlamaModel(LlamaPreTrainedModel):
+class TransfuserModel(TransfuserPreTrainedModel):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
 
@@ -704,7 +718,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [TransfuserDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
@@ -732,6 +746,7 @@ class LlamaModel(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        type_tensor: Optional[torch.uint8] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -801,6 +816,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     use_cache,
                     cache_position,
                     position_embeddings,
+                    type_tensor=type_tensor,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -812,6 +828,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
+                    type_tensor=type_tensor,
                 )
 
             hidden_states = layer_outputs[0]
@@ -913,12 +930,12 @@ class LlamaModel(LlamaPreTrainedModel):
         return causal_mask
 
 
-class LlamaForCausalLM(LlamaPreTrainedModel):
+class TransfuserForCausalLM(TransfuserPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = LlamaModel(config)
+        self.model = TransfuserModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
