@@ -703,7 +703,7 @@ LLAMA_INPUTS_DOCSTRING = r"""
     "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
     LLAMA_START_DOCSTRING,
 )
-class TransfuserModel(TransfuserPreTrainedModel):
+class TransfuserLanguageModel(TransfuserPreTrainedModel):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
 
@@ -747,6 +747,7 @@ class TransfuserModel(TransfuserPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         type_tensor: Optional[torch.uint8] = None,
+        timestep: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -806,6 +807,9 @@ class TransfuserModel(TransfuserPreTrainedModel):
                 all_hidden_states += (hidden_states,)
 
             if self.gradient_checkpointing and self.training:
+                if decoder_layer.idx == self.config.num_hidden_layers - self.config.num_diffusion_layers:
+                    # Add gaussian noise to the hidden states
+                    hidden_states = self.add_noise(hidden_states, type_tensor, timestep)
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
@@ -817,6 +821,7 @@ class TransfuserModel(TransfuserPreTrainedModel):
                     cache_position,
                     position_embeddings,
                     type_tensor=type_tensor,
+                    timestep=timestep,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -829,6 +834,7 @@ class TransfuserModel(TransfuserPreTrainedModel):
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
                     type_tensor=type_tensor,
+                    timestep=timestep,
                 )
 
             hidden_states = layer_outputs[0]
@@ -857,6 +863,23 @@ class TransfuserModel(TransfuserPreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
+        
+    def add_noise(self, hidden_states, type_tensor, timestep):
+        # Ensure that alpha_bar is available in your configuration or calculate it.
+        alpha_bar = self.config.alpha_bars[timestep]
+
+        # Create Gaussian noise
+        noise_shape = hidden_states.shape
+        gaussian_noise = torch.randn(noise_shape, device=hidden_states.device)
+
+        # Scale the noise
+        scaled_noise = torch.sqrt(1 - alpha_bar) * gaussian_noise
+
+        # Add noise only to the image tokens
+        noise_mask = type_tensor == 1  # Select image tokens
+        hidden_states[noise_mask] += scaled_noise[noise_mask]
+
+        return hidden_states
 
     def _update_causal_mask(
         self,
@@ -935,7 +958,7 @@ class TransfuserForCausalLM(TransfuserPreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = TransfuserModel(config)
+        self.model = TransfuserLanguageModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -975,6 +998,8 @@ class TransfuserForCausalLM(TransfuserPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        type_tensor: Optional[torch.uint8] = None,
+        timestep: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -1019,9 +1044,13 @@ class TransfuserForCausalLM(TransfuserPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
+            type_tensor=type_tensor,
+            timestep=timestep
         )
 
         hidden_states = outputs[0]
+        
+        # TODO: Process the image tokens differently
         if self.config.pretraining_tp > 1:
             lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
             logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
@@ -1124,3 +1153,163 @@ class TransfuserForCausalLM(TransfuserPreTrainedModel):
             }
         )
         return model_inputs
+    
+class TransfusionEmbeddings(nn.Module):
+    def __init__(self, config: TransfusionConfig):
+        super().__init__()
+        self.text_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.image_embedding = nn.Conv2d(in_channels=3, out_channels=config.hidden_size, kernel_size=config.patch_size, stride=config.patch_size)
+        self.position_embedding = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+    
+    def forward(self, input_ids: torch.Tensor, type_tensor: torch.Tensor):
+        # Text tokens: type_tensor == 0
+        text_mask = type_tensor == 0
+        image_mask = type_tensor == 1
+        
+        # Embed text tokens
+        text_embeds = self.text_embedding(input_ids[text_mask]) if text_mask.any() else None
+        
+        # Embed image patches
+        image_patches = input_ids[image_mask] if image_mask.any() else None
+        if image_patches is not None:
+            image_embeds = self.image_embedding(image_patches.permute(0, 3, 1, 2))  # Convert (batch, H, W, C) to (batch, C, H, W)
+            image_embeds = image_embeds.flatten(2).transpose(1, 2)  # Flatten to match token shape
+            
+        # Combine
+        embeds = torch.cat([text_embeds, image_embeds], dim=1) if text_embeds is not None and image_embeds is not None else text_embeds or image_embeds
+        
+        return embeds
+
+class UNetDownsampler(nn.Module):
+    def __init__(self, config: TransfusionConfig):
+        super().__init__()
+        self.config = config
+
+        # Create a timestep embedding MLP to map the timestep to the appropriate size
+        self.timestep_embed = nn.Sequential(
+            nn.Linear(1, config.hidden_size),   # Map scalar timestep to a vector of the same size as hidden states
+            nn.ReLU(),
+            nn.Linear(config.hidden_size, config.hidden_size)
+        )
+
+        # Define downsampling layers
+        self.layers = nn.ModuleList([
+            nn.Conv2d(config.hidden_size, config.hidden_size // 2, kernel_size=3, stride=2, padding=1)
+            for _ in range(config.num_diffusion_layers)
+        ])
+
+    def forward(self, x: torch.Tensor, timestep: torch.Tensor):
+        # Embed the timestep
+        timestep = timestep.view(-1, 1)  # Reshape timestep to have a batch dimension
+        t_emb = self.timestep_embed(timestep)  # Get the timestep embedding
+
+        # Reshape timestep embedding for addition to the input feature maps
+        t_emb = t_emb.view(t_emb.shape[0], t_emb.shape[1], 1, 1)  # Reshape to match the spatial dimensions of the image
+
+        # Apply each downsampling layer and add timestep embedding
+        for layer in self.layers:
+            x = layer(x)  # Apply convolution
+
+            # Add timestep embedding to the feature map
+            x = x + t_emb
+
+            # Apply ReLU activation
+            x = nn.functional.relu(x)
+
+        return x
+
+class UNetUpsampler(nn.Module):
+    def __init__(self, config: TransfusionConfig):
+        super().__init__()
+        self.config = config
+
+        # Create a timestep embedding MLP for upsampling, similar to the downsampler
+        self.timestep_embed = nn.Sequential(
+            nn.Linear(1, config.hidden_size),   # Map scalar timestep to a vector of the same size as hidden states
+            nn.ReLU(),
+            nn.Linear(config.hidden_size, config.hidden_size)
+        )
+
+        # Define upsampling layers
+        self.layers = nn.ModuleList([
+            nn.ConvTranspose2d(config.hidden_size // 2, config.hidden_size, kernel_size=3, stride=2, padding=1, output_padding=1)
+            for _ in range(config.num_diffusion_layers)
+        ])
+
+    def forward(self, x: torch.Tensor, timestep: torch.Tensor):
+        # Embed the timestep
+        timestep = timestep.view(-1, 1)  # Reshape timestep to have a batch dimension
+        t_emb = self.timestep_embed(timestep)  # Get the timestep embedding
+
+        # Reshape timestep embedding for addition to the input feature maps
+        t_emb = t_emb.view(t_emb.shape[0], t_emb.shape[1], 1, 1)  # Reshape to match the spatial dimensions of the image
+
+        # Apply each upsampling layer and add timestep embedding
+        for layer in self.layers:
+            x = layer(x)  # Apply transposed convolution (upsampling)
+
+            # Add timestep embedding to the feature map
+            x = x + t_emb
+
+            # Apply ReLU activation
+            x = nn.functional.relu(x)
+
+        return x
+
+
+class TransfuserModel(PreTrainedModel):
+    
+    def __init__(self, config: TransfusionConfig):
+        super().__init__(config)
+        self.config = config
+        
+        # Text tokenizing and image patchifying at the same time
+        # Takes type_tensor as input, 0 means text, 1 means image, 2 means special tokens
+        self.embeddings = TransfusionEmbeddings(config)
+
+        self.downsampler = UNetDownsampler(config)
+        self.transformer = TransfuserLanguageModel(config)
+        self.upsampler = UNetUpsampler(config)
+        
+        # Final layer to predict noise (3-channel RGB)
+        self.noise_predictor = nn.Conv2d(self.config.hidden_size, 3, kernel_size=1)
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        type_tensor: Optional[torch.uint8] = None,
+        timestep: Optional[torch.Tensor] = None,
+        **kwargs
+    ):
+        input_embeds = self.embeddings(input_ids, type_tensor)
+        downsampled = self.downsampler(input_embeds, timestep)  # Note: Change inputs_embeds to input_embeds
+        transformer_outputs = self.transformer(
+            input_ids=downsampled,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+            type_tensor=type_tensor,
+            timestep=timestep,
+            **kwargs
+        )
+        upsampled = self.upsampler(transformer_outputs, timestep)
+        
+        # Predict noise instead of restoring the image
+        predicted_noise = self.noise_predictor(upsampled)
+        
+        return predicted_noise
