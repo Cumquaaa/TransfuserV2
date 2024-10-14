@@ -51,7 +51,7 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 from transformers.models.llama.configuration_llama import LlamaConfig
-
+from diffusers.models import AutoencoderKL
 
 logger = logging.get_logger(__name__)
 
@@ -112,10 +112,33 @@ def _prepare_4d_causal_attention_mask_with_cache_position(
     return causal_mask
 
 class TransfusionConfig(LlamaConfig):
-    def __init__(self, num_diffusion_layers=1, num_patches=2, **kwargs):
+    def __init__(self, 
+                 image_token_dim:int = 256,
+                 num_diffusion_layers:int=1, 
+                 num_patches:int=2, 
+                 alpha_bars:torch.Tensor=None, 
+                 train_timesteps:torch.Tensor=None,
+                 inference_timesteps:torch.Tensor=None,
+                 lambda_image_loss:torch.Float=0.0,
+                 **kwargs
+                ):
+        '''
+        image_token_dim: dimension of image tokens
+        num_diffusion_layers: number of diffusion layers
+        num_patches: number of patches that gets forwarded in one pass
+        alpha_bars: tensor of shape (num_time_steps, ) (?), scheduler for noise by timestep
+        train_timesteps: tensor of shape (num_time_steps, ), timesteps for diffusion
+        inference_timesteps: tensor of shape (num_time_steps, ), timesteps for inference
+        '''
         super().__init__(**kwargs)
+        self.image_token_dim = image_token_dim
         self.num_diffusion_layers = num_diffusion_layers
         self.num_patches = num_patches
+        # TODO: Implement this num_patch in inference/training
+        self.alpha_bars = alpha_bars
+        self.train_timesteps = train_timesteps
+        self.inference_timesteps = inference_timesteps
+        self.lambda_image_loss=lambda_image_loss
 
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -703,7 +726,7 @@ LLAMA_INPUTS_DOCSTRING = r"""
     "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
     LLAMA_START_DOCSTRING,
 )
-class TransfuserLanguageModel(TransfuserPreTrainedModel):
+class TransfuserModel(TransfuserPreTrainedModel):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
 
@@ -716,27 +739,46 @@ class TransfuserLanguageModel(TransfuserPreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        # Embedding for text tokens
+        self.embed_text_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.vae_encoder = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse")
+        self.downsampler = UNetDownsampler(config)
+
         self.layers = nn.ModuleList(
             [TransfuserDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
+
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
-        self.gradient_checkpointing = False
 
-        # Initialize weights and apply final processing
+        self.gradient_checkpointing = False
         self.post_init()
 
     def get_input_embeddings(self):
-        return self.embed_tokens
+        return self.embed_text_tokens
 
     def set_input_embeddings(self, value):
-        self.embed_tokens = value
+        self.embed_text_tokens = value
+
+    def embed_image(self, image):
+        # Apply VAE encoder first, then downsampler.
+        # Input `image` shape: [B, 3, H, W]  (Batch, Channels, Height, Width)
+        
+        # First, encode the image to latent space
+        vae_encoded = self.vae_encoder.encode(image).latent_dist.sample()
+        # VAE latent space output: [B, latent_dim, H', W']
+
+        # Now, downsample the encoded latents
+        downsampled = self.downsampler(vae_encoded)
+        # Downsampled output: [B, hidden_size, H'', W'']
+        
+        return downsampled
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     def forward(
         self,
         input_ids: torch.LongTensor = None,
+        input_image: torch.FloatTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
@@ -746,8 +788,8 @@ class TransfuserLanguageModel(TransfuserPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        type_tensor: Optional[torch.uint8] = None,
         timestep: Optional[torch.Tensor] = None,
+        diffusion_pass: Optional[bool] = None, # Whether we are in the diffusion pass or not
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -768,7 +810,16 @@ class TransfuserLanguageModel(TransfuserPreTrainedModel):
             use_cache = False
 
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            text_embeds = self.embed_text_tokens(input_ids)  # Shape: [B, T_text, hidden_size]
+            image_embeds = self.embed_image(input_image)     # Shape: [B, hidden_size, H'', W'']
+
+            inputs_embeds = torch.cat((text_embeds, image_embeds), dim=1)  # Concatenated along sequence dim
+            # New shape: [B, T_text + (H'' * W''), hidden_size]
+
+        # Create type_tensor:
+        # Text tokens -> 0, Image tokens -> 1, Special tokens -> 2
+        type_tensor = torch.zeros_like(inputs_embeds[:, :, 0], dtype=torch.uint8)  # Shape: [B, T_text + H''*W'']
+        type_tensor[:, input_ids.size(1):] = 1  # Set image tokens to 1, text tokens remain 0            
 
         return_legacy_cache = False
         if (
@@ -797,33 +848,15 @@ class TransfuserLanguageModel(TransfuserPreTrainedModel):
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
+        noise = None
 
-        for decoder_layer in self.layers:
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            if self.gradient_checkpointing and self.training:
-                if decoder_layer.idx == self.config.num_hidden_layers - self.config.num_diffusion_layers:
-                    # Add gaussian noise to the hidden states
-                    hidden_states = self.add_noise(hidden_states, type_tensor, timestep)
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    causal_mask,
-                    position_ids,
-                    past_key_values,
-                    output_attentions,
-                    use_cache,
-                    cache_position,
-                    position_embeddings,
-                    type_tensor=type_tensor,
-                    timestep=timestep,
-                )
-            else:
+        if diffusion_pass:
+            # If diffusion_pass is True, only process the last num_diffusion_layers
+            for i in range(self.config.num_hidden_layers - self.config.num_diffusion_layers, self.config.num_hidden_layers):
+                decoder_layer = self.layers[i]
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=causal_mask,
@@ -836,14 +869,50 @@ class TransfuserLanguageModel(TransfuserPreTrainedModel):
                     type_tensor=type_tensor,
                     timestep=timestep,
                 )
+                hidden_states = layer_outputs[0]
+                if use_cache:
+                    next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+                if output_attentions:
+                    all_self_attns += (layer_outputs[1],)
+        else:
+            # Normal forward pass
+            for decoder_layer in self.layers:
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
 
-            hidden_states = layer_outputs[0]
-
-            if use_cache:
-                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
-
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                if self.gradient_checkpointing and self.training:
+                    if decoder_layer.idx == self.config.num_hidden_layers - self.config.num_diffusion_layers:
+                        # Add gaussian noise to the hidden states
+                        hidden_states, noise = self.add_noise(hidden_states, type_tensor, timestep)
+                    layer_outputs = self._gradient_checkpointing_func(
+                        decoder_layer.__call__,
+                        hidden_states,
+                        causal_mask,
+                        position_ids,
+                        past_key_values,
+                        output_attentions,
+                        use_cache,
+                        cache_position,
+                        position_embeddings,
+                        type_tensor=type_tensor,
+                    )
+                else:
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=causal_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                        type_tensor=type_tensor,
+                    )
+                hidden_states = layer_outputs[0]
+                if use_cache:
+                    next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+                if output_attentions:
+                    all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
 
@@ -856,12 +925,14 @@ class TransfuserLanguageModel(TransfuserPreTrainedModel):
             next_cache = next_cache.to_legacy_cache()
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, type_tensor, noise] if v is not None)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
+            type_tensor=type_tensor,
+            noise=noise
         )
         
     def add_noise(self, hidden_states, type_tensor, timestep):
@@ -877,9 +948,10 @@ class TransfuserLanguageModel(TransfuserPreTrainedModel):
 
         # Add noise only to the image tokens
         noise_mask = type_tensor == 1  # Select image tokens
-        hidden_states[noise_mask] += scaled_noise[noise_mask]
+        noise = scaled_noise[noise_mask]
+        hidden_states[noise_mask] += noise
 
-        return hidden_states
+        return hidden_states, noise
 
     def _update_causal_mask(
         self,
@@ -953,14 +1025,15 @@ class TransfuserLanguageModel(TransfuserPreTrainedModel):
         return causal_mask
 
 
-class TransfuserForCausalLM(TransfuserPreTrainedModel):
+class TransfuserForCausalMM(TransfuserPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config):
+    def __init__(self, config: TransfusionConfig):
         super().__init__(config)
-        self.model = TransfuserLanguageModel(config)
+        self.model = TransfuserModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.image_noise_head = nn.Linear(config.hidden_size, config.image_token_dim)  # Maps hidden_size to noise dimension
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -998,8 +1071,8 @@ class TransfuserForCausalLM(TransfuserPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        type_tensor: Optional[torch.uint8] = None,
         timestep: Optional[torch.Tensor] = None,
+        diffusion_pass: Optional[bool] = None, # Whether we are in the diffusion pass or not
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -1044,141 +1117,200 @@ class TransfuserForCausalLM(TransfuserPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
-            type_tensor=type_tensor,
-            timestep=timestep
+            timestep=timestep,
+            diffusion_pass=diffusion_pass,
         )
 
-        hidden_states = outputs[0]
-        
-        # TODO: Process the image tokens differently
-        if self.config.pretraining_tp > 1:
-            lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
-            logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
-            logits = torch.cat(logits, dim=-1)
-        else:
-            logits = self.lm_head(hidden_states)
-        logits = logits.float()
+        hidden_states = outputs[0]  # shape: (batch_size, seq_len, hidden_size)
+        type_tensor = outputs[4]    # shape: (batch_size, seq_len)
+        noise = outputs[5]          # shape: (batch_size,seq_len, hidden_size)
 
-        loss = None
+        # Initialize logits and noise predictions
+        logits = torch.zeros_like(hidden_states)
+        noise_predictions = torch.zeros_like(hidden_states)
+
+        # Process text tokens (where type_tensor == 0) through the lm_head
+        text_mask = type_tensor == 0
+        if text_mask.any():
+            text_hidden_states = hidden_states[text_mask]  # Get text token hidden states
+            if self.config.pretraining_tp > 1:
+                lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
+                text_logits = [F.linear(text_hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
+                text_logits = torch.cat(text_logits, dim=-1)
+            else:
+                text_logits = self.lm_head(text_hidden_states)
+            text_logits = text_logits.float()
+            logits[text_mask] = text_logits  # Insert text logits back into the logits tensor
+
+        # Process image tokens (where type_tensor == 1) through the image_noise_head
+        image_mask = type_tensor == 1
+        if image_mask.any():
+            image_hidden_states = hidden_states[image_mask]  # Get image token hidden states
+            predicted_noise = self.image_noise_head(image_hidden_states)  # Predict noise
+            noise_predictions[image_mask] = predicted_noise  # Store noise predictions
+
+        # Calculate the image loss using the actual noise and predicted noise
+        image_loss = None
+        if image_mask.any() and noise is not None:
+            image_loss_fct = F.mse_loss  # Using Mean Squared Error loss for denoising
+            image_loss = image_loss_fct(predicted_noise, noise)  # Compare predicted noise with actual noise
+
+        # Combine losses if necessary
+        text_loss = None
         if labels is not None:
-            # Shift so that tokens < n predict n
+            # Existing loss computation for text tokens
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
             loss_fct = CrossEntropyLoss()
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+            text_loss = loss_fct(shift_logits, shift_labels)
 
+        # Adjusting the return statement to include both losses
         if not return_dict:
-            output = (logits,) + outputs[1:]
-            return (loss,) + output if loss is not None else output
+            output = (logits, noise_predictions) + outputs[1:]
+            return (text_loss, image_loss) + output
 
         return CausalLMOutputWithPast(
-            loss=loss,
+            loss=(text_loss, image_loss),
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            noise_predictions=noise_predictions,  # Return predicted noise for image tokens
         )
 
-    def prepare_inputs_for_generation(
-        self,
-        input_ids,
-        past_key_values=None,
-        attention_mask=None,
-        inputs_embeds=None,
-        cache_position=None,
-        position_ids=None,
-        use_cache=True,
-        **kwargs,
-    ):
-        # If we have cache: let's slice `input_ids` through `cache_position`, to keep only the unprocessed tokens
-        # Exception 1: when passing input_embeds, input_ids may be missing entries
-        # Exception 2: some generation methods do special slicing of input_ids, so we don't need to do it here
-        if past_key_values is not None:
-            if inputs_embeds is not None:  # Exception 1
-                input_ids = input_ids[:, -cache_position.shape[0] :]
-            elif input_ids.shape[1] != cache_position.shape[0]:  # Default case (the "else", a no op, is Exception 2)
-                input_ids = input_ids[:, cache_position]
-
-        if attention_mask is not None and position_ids is None:
-            # create position_ids on the fly for batch generation
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            if past_key_values:
-                position_ids = position_ids[:, -input_ids.shape[1] :]
-
-                # This `clone` call is needed to avoid recapturing cuda graphs with `torch.compile`'s  `mode="reduce-overhead`, as otherwise the input `position_ids` would have various stride during the decoding. Here, simply using `.contiguous()` is not sufficient as in the batch size = 1 case, `position_ids` is already contiguous but with varying stride which retriggers a capture.
-                position_ids = position_ids.clone(memory_format=torch.contiguous_format)
-
-        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if inputs_embeds is not None and cache_position[0] == 0:
-            model_inputs = {"inputs_embeds": inputs_embeds, "input_ids": None}
-        else:
-            # The clone here is for the same reason as for `position_ids`.
-            model_inputs = {"input_ids": input_ids.clone(memory_format=torch.contiguous_format), "inputs_embeds": None}
-
-        if isinstance(past_key_values, StaticCache) and attention_mask.ndim == 2:
-            if model_inputs["inputs_embeds"] is not None:
-                batch_size, sequence_length, _ = model_inputs["inputs_embeds"].shape
-                device = model_inputs["inputs_embeds"].device
-            else:
-                batch_size, sequence_length = model_inputs["input_ids"].shape
-                device = model_inputs["input_ids"].device
-
-            dtype = self.lm_head.weight.dtype
-            min_dtype = torch.finfo(dtype).min
-
-            attention_mask = _prepare_4d_causal_attention_mask_with_cache_position(
-                attention_mask,
-                sequence_length=sequence_length,
-                target_length=past_key_values.get_max_length(),
-                dtype=dtype,
-                device=device,
-                min_dtype=min_dtype,
-                cache_position=cache_position,
-                batch_size=batch_size,
-            )
-
-        model_inputs.update(
-            {
-                "position_ids": position_ids,
-                "cache_position": cache_position,
-                "past_key_values": past_key_values,
-                "use_cache": use_cache,
-                "attention_mask": attention_mask,
-            }
-        )
-        return model_inputs
-    
-class TransfusionEmbeddings(nn.Module):
+class TransfuserForTraining(TransfuserForCausalMM):
+    '''
+    Class for Transfuser model for training
+    '''
     def __init__(self, config: TransfusionConfig):
-        super().__init__()
-        self.text_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.image_embedding = nn.Conv2d(in_channels=3, out_channels=config.hidden_size, kernel_size=config.patch_size, stride=config.patch_size)
-        self.position_embedding = nn.Embedding(config.max_position_embeddings, config.hidden_size)
-    
-    def forward(self, input_ids: torch.Tensor, type_tensor: torch.Tensor):
-        # Text tokens: type_tensor == 0
-        text_mask = type_tensor == 0
-        image_mask = type_tensor == 1
+        super().__init__(config)
+        self.config = config
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=0.001)  # Initialize the optimizer
+
+    def train_step(self, 
+                   input_ids, 
+                   attention_mask=None, 
+                   position_ids=None, 
+                   labels=None, 
+                   use_cache=None, 
+                   output_attentions=None, 
+                   output_hidden_states=None, 
+                   return_dict=None,
+                   timestep=None):  # Accept timestep as an argument
+        self.train()  # Set the model to training mode
+        self.optimizer.zero_grad()  # Clear previous gradients
+
+        # Forward pass to get logits and noise predictions
+        outputs = self.forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            labels=labels,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            timestep=timestep,  # Pass the timestep to the forward method
+            diffusion_pass=False
+        )
+
+        # Extract losses
+        text_loss, image_loss, logits, noise_predictions, *other_outputs = outputs
+
+        # Calculate total losses
+        total_loss = text_loss + self.config.lambda_image_loss * image_loss
+
+        # Backpropagation
+        total_loss.backward()  # Compute gradients
+        self.optimizer.step()  # Update weights
+
+        return total_loss.item()  # Return the loss value for monitoring
+
+    def train_epoch(self, dataloader, device):
+        '''
+        Train for one epoch
+
+        Args:
+            dataloader: DataLoader providing batches of data
+            device: Device to run the model on (e.g., 'cuda' or 'cpu')
+        '''
+        self.to(device)  # Move the model to the specified device
+        total_loss = 0.0
+        num_timesteps = self.config.train_timesteps.shape[0]  # Get the number of timesteps
+
+        for batch in dataloader:
+            # Move batch to device
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch.get('attention_mask', None).to(device) if 'attention_mask' in batch else None
+            position_ids = batch.get('position_ids', None).to(device) if 'position_ids' in batch else None
+            labels = batch.get('labels', None).to(device) if 'labels' in batch else None
+
+            # Iterate through the specified timesteps
+            for t in range(num_timesteps):
+                timestep = self.config.train_timesteps[t]  # Get current timestep
+                # Train on the current batch
+                loss = self.train_step(input_ids, attention_mask, position_ids, labels, timestep=timestep)
+                total_loss += loss
+
+        avg_loss = total_loss / (len(dataloader) * num_timesteps)  # Average loss for the epoch
+        return avg_loss
+
+    def evaluate(self, dataloader, device):
+        '''
+        Evaluate the model on a validation set
+
+        Args:
+            dataloader: DataLoader providing batches of data
+            device: Device to run the model on (e.g., 'cuda' or 'cpu')
         
-        # Embed text tokens
-        text_embeds = self.text_embedding(input_ids[text_mask]) if text_mask.any() else None
-        
-        # Embed image patches
-        image_patches = input_ids[image_mask] if image_mask.any() else None
-        if image_patches is not None:
-            image_embeds = self.image_embedding(image_patches.permute(0, 3, 1, 2))  # Convert (batch, H, W, C) to (batch, C, H, W)
-            image_embeds = image_embeds.flatten(2).transpose(1, 2)  # Flatten to match token shape
-            
-        # Combine
-        embeds = torch.cat([text_embeds, image_embeds], dim=1) if text_embeds is not None and image_embeds is not None else text_embeds or image_embeds
-        
-        return embeds
+        Returns:
+            avg_loss: Average loss over the validation set
+        '''
+        self.eval()  # Set the model to evaluation mode
+        total_loss = 0.0
+        with torch.no_grad():  # Disable gradient computation
+            for batch in dataloader:
+                # Move batch to device
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch.get('attention_mask', None).to(device) if 'attention_mask' in batch else None
+                position_ids = batch.get('position_ids', None).to(device) if 'position_ids' in batch else None
+                labels = batch.get('labels', None).to(device) if 'labels' in batch else None
+
+                # Forward pass to get outputs
+                outputs = self.forward(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    labels=labels,
+                    return_dict=True,  # Use dict to easily access outputs
+                )
+
+                # Extract losses
+                text_loss, image_loss, logits, noise_predictions, *other_outputs = outputs
+
+                # Calculate total losses
+                total_loss += text_loss + self.config.lambda_image_loss * image_loss
+
+        avg_loss = total_loss / len(dataloader)  # Average loss for the validation set
+        return avg_loss
+
+    def fit(self, train_dataloader, val_dataloader, epochs, device):
+        '''
+        Main training loop
+
+        Args:
+            train_dataloader: DataLoader for training data
+            val_dataloader: DataLoader for validation data
+            epochs: Number of training epochs
+            device: Device to run the model on (e.g., 'cuda' or 'cpu')
+        '''
+        for epoch in range(epochs):
+            train_loss = self.train_epoch(train_dataloader, device)
+            val_loss = self.evaluate(val_dataloader, device)
+            print(f'Epoch {epoch + 1}/{epochs}, Train Loss: {train_loss:.4f}, Validation Loss: {val_loss:.4f}')    
 
 class UNetDownsampler(nn.Module):
     def __init__(self, config: TransfusionConfig):
@@ -1255,61 +1387,3 @@ class UNetUpsampler(nn.Module):
             x = nn.functional.relu(x)
 
         return x
-
-
-class TransfuserModel(PreTrainedModel):
-    
-    def __init__(self, config: TransfusionConfig):
-        super().__init__(config)
-        self.config = config
-        
-        # Text tokenizing and image patchifying at the same time
-        # Takes type_tensor as input, 0 means text, 1 means image, 2 means special tokens
-        self.embeddings = TransfusionEmbeddings(config)
-
-        self.downsampler = UNetDownsampler(config)
-        self.transformer = TransfuserLanguageModel(config)
-        self.upsampler = UNetUpsampler(config)
-        
-        # Final layer to predict noise (3-channel RGB)
-        self.noise_predictor = nn.Conv2d(self.config.hidden_size, 3, kernel_size=1)
-
-    def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        type_tensor: Optional[torch.uint8] = None,
-        timestep: Optional[torch.Tensor] = None,
-        **kwargs
-    ):
-        input_embeds = self.embeddings(input_ids, type_tensor)
-        downsampled = self.downsampler(input_embeds, timestep)  # Note: Change inputs_embeds to input_embeds
-        transformer_outputs = self.transformer(
-            input_ids=downsampled,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
-            type_tensor=type_tensor,
-            timestep=timestep,
-            **kwargs
-        )
-        upsampled = self.upsampler(transformer_outputs, timestep)
-        
-        # Predict noise instead of restoring the image
-        predicted_noise = self.noise_predictor(upsampled)
-        
-        return predicted_noise
