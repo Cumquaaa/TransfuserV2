@@ -113,13 +113,14 @@ def _prepare_4d_causal_attention_mask_with_cache_position(
 
 class TransfusionConfig(LlamaConfig):
     def __init__(self, 
-                 image_token_dim:int = 256,
-                 num_diffusion_layers:int=1, 
-                 num_patches:int=2, 
-                 alpha_bars:torch.Tensor=None, 
-                 train_timesteps:torch.Tensor=None,
-                 inference_timesteps:torch.Tensor=None,
-                 lambda_image_loss:torch.Float=0.0,
+                 image_token_dim: int = 256,
+                 num_diffusion_layers: int=1, 
+                 num_patches: int=2, 
+                 alpha_bars: torch.Tensor=None, 
+                 train_timesteps: torch.Tensor=None,
+                 inference_timesteps: torch.Tensor=None,
+                 lambda_image_loss: torch.Float=0.0,
+                 lambda_hidden_loss: torch.Float=0.0,
                  **kwargs
                 ):
         '''
@@ -129,6 +130,8 @@ class TransfusionConfig(LlamaConfig):
         alpha_bars: tensor of shape (num_time_steps, ) (?), scheduler for noise by timestep
         train_timesteps: tensor of shape (num_time_steps, ), timesteps for diffusion
         inference_timesteps: tensor of shape (num_time_steps, ), timesteps for inference
+        lambda_image_loss: weight for image loss
+        lambda_hidden_loss: weight for hidden loss
         '''
         super().__init__(**kwargs)
         self.image_token_dim = image_token_dim
@@ -138,7 +141,8 @@ class TransfusionConfig(LlamaConfig):
         self.alpha_bars = alpha_bars
         self.train_timesteps = train_timesteps
         self.inference_timesteps = inference_timesteps
-        self.lambda_image_loss=lambda_image_loss
+        self.lambda_image_loss = lambda_image_loss
+        self.lambda_hidden_loss = lambda_hidden_loss
 
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -739,8 +743,10 @@ class TransfuserModel(TransfuserPreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        # Embedding for text tokens
+        # Embedding for text tokens, <BOI>, and image tokens
         self.embed_text_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.boi_embedding = nn.Parameter(torch.randn(1, config.num_patches, config.hidden_size))  # Random initialization for <BOI>
+        self.eoi_embedding = nn.Parameter(torch.randn(1, config.num_patches, config.hidden_size))  # Shape: [1, num_eoi_tokens, hidden_size]
         self.vae_encoder = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse")
         self.downsampler = UNetDownsampler(config)
 
@@ -810,16 +816,28 @@ class TransfuserModel(TransfuserPreTrainedModel):
             use_cache = False
 
         if inputs_embeds is None:
+            # We ASSUME here that the input is text + image sequence!
             text_embeds = self.embed_text_tokens(input_ids)  # Shape: [B, T_text, hidden_size]
             image_embeds = self.embed_image(input_image)     # Shape: [B, hidden_size, H'', W'']
+            
+            # Generate <SOI>\<EOI> token embeddings and append
+            batch_size = text_embeds.size(0)
+            boi_embeds = self.boi_embedding.expand(batch_size, self.config.num_patches, -1)  # Shape: [B, num_patches, hidden_size]
+            eoi_embeds = self.eoi_embedding.expand(batch_size, self.config.num_patches, -1)  # Shape: [B, num_eoi_tokens, hidden_size]
+            
+            # Transform the image embeddings to have sequence-like dimensions
+            image_embeds = image_embeds.flatten(2)  # Shape: [B, hidden_size, H'' * W'']
+            image_embeds = image_embeds.permute(0, 2, 1)  # Shape: [B, H'' * W'', hidden_size]
 
-            inputs_embeds = torch.cat((text_embeds, image_embeds), dim=1)  # Concatenated along sequence dim
-            # New shape: [B, T_text + (H'' * W''), hidden_size]
+            inputs_embeds = torch.cat((text_embeds, boi_embeds, image_embeds), dim=1)  
+            shifted_embeds = torch.cat((text_embeds, image_embeds, eoi_embeds), dim=1)  
+            # Shape: [B, T_text + num_patches + (H'' * W''), hidden_size]
 
         # Create type_tensor:
-        # Text tokens -> 0, Image tokens -> 1, Special tokens -> 2
+        # Text tokens -> 0, Image tokens -> 1, <BOI> tokens -> 2
         type_tensor = torch.zeros_like(inputs_embeds[:, :, 0], dtype=torch.uint8)  # Shape: [B, T_text + H''*W'']
-        type_tensor[:, input_ids.size(1):] = 1  # Set image tokens to 1, text tokens remain 0            
+        type_tensor[:, input_ids.size(1): input_ids.size(1) + self.config.num_patches] = 2  # Set <BOI> tokens to 2
+        type_tensor[:, input_ids.size(1) + self.config.num_patches:] = 1  # Set image tokens to 1
 
         return_legacy_cache = False
         if (
@@ -882,6 +900,8 @@ class TransfuserModel(TransfuserPreTrainedModel):
 
                 if self.gradient_checkpointing and self.training:
                     if decoder_layer.idx == self.config.num_hidden_layers - self.config.num_diffusion_layers:
+                        #Take the states out for loss computation
+                        hidden_states_before_diffusion = hidden_states
                         # Add gaussian noise to the hidden states
                         hidden_states, noise = self.add_noise(hidden_states, type_tensor, timestep)
                     layer_outputs = self._gradient_checkpointing_func(
@@ -925,14 +945,16 @@ class TransfuserModel(TransfuserPreTrainedModel):
             next_cache = next_cache.to_legacy_cache()
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, type_tensor, noise] if v is not None)
+            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, type_tensor, noise, hidden_states_before_diffusion, shifted_embeds] if v is not None)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
             type_tensor=type_tensor,
-            noise=noise
+            noise=noise,
+            hidden_states_before_diffusion=hidden_states_before_diffusion,
+            shifted_embeds=shifted_embeds
         )
         
     def add_noise(self, hidden_states, type_tensor, timestep):
@@ -946,7 +968,7 @@ class TransfuserModel(TransfuserPreTrainedModel):
         # Scale the noise
         scaled_noise = torch.sqrt(1 - alpha_bar) * gaussian_noise
 
-        # Add noise only to the image tokens
+        # Add noise only to the image tokens, not <BOI> tokens
         noise_mask = type_tensor == 1  # Select image tokens
         noise = scaled_noise[noise_mask]
         hidden_states[noise_mask] += noise
@@ -1121,9 +1143,12 @@ class TransfuserForCausalMM(TransfuserPreTrainedModel):
             diffusion_pass=diffusion_pass,
         )
 
-        hidden_states = outputs[0]  # shape: (batch_size, seq_len, hidden_size)
-        type_tensor = outputs[4]    # shape: (batch_size, seq_len)
-        noise = outputs[5]          # shape: (batch_size,seq_len, hidden_size)
+        # [hidden_states, next_cache, all_hidden_states, all_self_attns, type_tensor, noise, hidden_states_before_diffusion, shifted_embeds]
+        hidden_states = outputs[0]                   # shape: (batch_size, seq_len, hidden_size)
+        type_tensor = outputs[4]                     # shape: (batch_size, seq_len)
+        noise = outputs[5]                           # shape: (batch_size,seq_len, hidden_size)
+        hidden_states_before_diffusion = outputs[6]  # shape: (batch_size, seq_len, hidden_size)
+        shifted_embeds = outputs[7]                  # shape: (batch_size, seq_len, hidden_size)
 
         # Initialize logits and noise predictions
         logits = torch.zeros_like(hidden_states)
@@ -1142,20 +1167,27 @@ class TransfuserForCausalMM(TransfuserPreTrainedModel):
             text_logits = text_logits.float()
             logits[text_mask] = text_logits  # Insert text logits back into the logits tensor
 
-        # Process image tokens (where type_tensor == 1) through the image_noise_head
-        image_mask = type_tensor == 1
+        # Process image tokens (where type_tensor == 1 or 2) through the image_noise_head
+        image_mask = type_tensor != 0
         if image_mask.any():
             image_hidden_states = hidden_states[image_mask]  # Get image token hidden states
             predicted_noise = self.image_noise_head(image_hidden_states)  # Predict noise
             noise_predictions[image_mask] = predicted_noise  # Store noise predictions
+        
+        # Calculate the loss before diffusion pass
+        hidden_loss = None
+        if image_mask.any():
+            hidden_loss_fct = F.mse_loss
+            hidden_loss = hidden_loss_fct(hidden_states_before_diffusion[image_mask], shifted_embeds[image_mask])
 
         # Calculate the image loss using the actual noise and predicted noise
         image_loss = None
         if image_mask.any() and noise is not None:
             image_loss_fct = F.mse_loss  # Using Mean Squared Error loss for denoising
-            image_loss = image_loss_fct(predicted_noise, noise)  # Compare predicted noise with actual noise
+            # Compare predicted noise with actual noise, shifting num_patches for labelling
+            image_loss = image_loss_fct(predicted_noise[:, :-self.config.num_patches, :], noise[:, self.config.num_patches:, :]) 
 
-        # Combine losses if necessary
+        # Calaulate the text loss
         text_loss = None
         if labels is not None:
             # Existing loss computation for text tokens
@@ -1167,13 +1199,13 @@ class TransfuserForCausalMM(TransfuserPreTrainedModel):
             shift_labels = shift_labels.to(shift_logits.device)
             text_loss = loss_fct(shift_logits, shift_labels)
 
-        # Adjusting the return statement to include both losses
+        # Adjusting the return statement to include all losses
         if not return_dict:
             output = (logits, noise_predictions) + outputs[1:]
-            return (text_loss, image_loss) + output
+            return (text_loss, image_loss, hidden_loss) + output
 
         return CausalLMOutputWithPast(
-            loss=(text_loss, image_loss),
+            loss=(text_loss, image_loss, hidden_loss),
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
@@ -1218,10 +1250,10 @@ class TransfuserForTraining(TransfuserForCausalMM):
         )
 
         # Extract losses
-        text_loss, image_loss, logits, noise_predictions, *other_outputs = outputs
+        text_loss, image_loss, hidden_loss, logits, noise_predictions, *other_outputs = outputs
 
         # Calculate total losses
-        total_loss = text_loss + self.config.lambda_image_loss * image_loss
+        total_loss = text_loss + self.config.lambda_image_loss * image_loss + self.config.lambda_hidden_loss * hidden_loss
 
         # Backpropagation
         total_loss.backward()  # Compute gradients
